@@ -328,7 +328,11 @@ impl TTLCache {
     }
 
     pub fn __traverse__(&self, visit: pyo3::PyVisit<'_>) -> Result<(), pyo3::PyTraverseError> {
-        for value in self.raw.lock().entries_iter() {
+        // A Python callback can run GC while this cache already owns the mutex.
+        let Some(cache) = self.raw.try_lock() else {
+            return Ok(());
+        };
+        for value in cache.entries_iter() {
             visit.call(&value.key.obj)?;
             visit.call(&value.value)?;
         }

@@ -3,7 +3,7 @@ import asyncio
 import functools
 import inspect
 import typing
-from collections import defaultdict, namedtuple
+from collections import namedtuple
 
 from ._cachebox import BaseCacheImpl, FIFOCache
 
@@ -167,34 +167,62 @@ class Frozen(BaseCacheImpl[KT, VT]):  # pragma: no cover
 
 
 class _LockWithCounter:
-    """
-    A lock with a counter to track the number of waiters.
+    """One computation and its registered callers for a cache key."""
 
-    This class provides a lock mechanism that supports both synchronous and asynchronous contexts,
-    with the ability to track the number of threads or coroutines waiting to acquire the lock.
-    """
-
-    __slots__ = ("lock", "waiters")
+    __slots__ = ("lock", "waiters", "error")
 
     def __init__(self, is_async: bool = False):
         self.lock = _thread.allocate_lock() if not is_async else asyncio.Lock()
         self.waiters = 0
+        self.error: typing.Optional[Exception] = None
 
     async def __aenter__(self) -> None:
-        self.waiters += 1
         await self.lock.acquire()  # type: ignore[misc]
 
     async def __aexit__(self, *args, **kwds) -> None:
-        self.waiters -= 1
         self.lock.release()
 
     def __enter__(self) -> None:
-        self.waiters += 1
         self.lock.acquire()
 
     def __exit__(self, *args, **kwds) -> None:
-        self.waiters -= 1
         self.lock.release()
+
+
+class _LockRegistry:
+    """Own per-key state only while a caller computes or waits.
+
+    Reserve a caller under the registry guard before it acquires the per-key
+    lock. This prevents removal while another thread is about to wait.
+    """
+
+    def __init__(self, is_async: bool = False):
+        self._entries: typing.Dict[typing.Hashable, _LockWithCounter] = {}
+        self._guard = _thread.allocate_lock()
+        self._is_async = is_async
+
+    def reserve(self, key: typing.Hashable) -> _LockWithCounter:
+        with self._guard:
+            state = self._entries.get(key)
+            if state is None:
+                state = self._entries[key] = _LockWithCounter(self._is_async)
+            state.waiters += 1
+            return state
+
+    def release(self, key: typing.Hashable, state: _LockWithCounter) -> None:
+        with self._guard:
+            state.waiters -= 1
+            if state.waiters == 0:
+                if self._entries.get(key) is state:
+                    del self._entries[key]
+                # Tracebacks can refer back to this state through wrapper frames.
+                state.error = None
+
+    def clear(self) -> None:
+        with self._guard:
+            for state in self._entries.values():
+                state.error = None
+            self._entries.clear()
 
 
 def _copy_if_need(obj: VT, tocopy=(dict, list, set), level: int = 1) -> VT:
@@ -286,11 +314,10 @@ def _cached_wrapper(
 
     hits = 0
     misses = 0
-    locks: defaultdict[typing.Hashable, _LockWithCounter] = defaultdict(_LockWithCounter)
-    exceptions: typing.Dict[typing.Hashable, BaseException] = {}
+    locks = _LockRegistry()
 
     def _wrapped(*args, **kwds):
-        nonlocal hits, misses, locks, exceptions
+        nonlocal hits, misses
 
         if kwds.pop("cachebox__ignore", False):
             return func(*args, **kwds)
@@ -313,28 +340,29 @@ def _cached_wrapper(
 
             return _copy_if_need(result, level=copy_level)
 
-        with locks[key]:
-            if exceptions.get(key, None) is not None:
-                cached_error = exceptions[key] if locks[key].waiters > 1 else exceptions.pop(key)
-                raise cached_error
+        state = locks.reserve(key)
+        try:
+            with state:
+                if state.error is not None:
+                    raise state.error
 
-            try:
-                result = _cache[key]
-                hits += 1
-                event = EVENT_HIT
-            except KeyError:
                 try:
-                    result = func(*args, **kwds)
-                except Exception as e:
-                    if locks[key].waiters > 1:
-                        exceptions[key] = e
-
-                    raise e
-
-                else:
-                    _cache[key] = result
-                    misses += 1
-                    event = EVENT_MISS
+                    result = _cache[key]
+                    hits += 1
+                    event = EVENT_HIT
+                except KeyError:
+                    try:
+                        result = func(*args, **kwds)
+                    except Exception as error:
+                        state.error = error
+                        raise
+                    else:
+                        _cache[key] = result
+                        misses += 1
+                        event = EVENT_MISS
+        finally:
+            # Release the registered caller even if lock acquisition fails.
+            locks.release(key, state)
 
         if callback is not None:
             callback(event, key, result)
@@ -352,12 +380,11 @@ def _cached_wrapper(
     if not cache_is_function:
 
         def cache_clear() -> None:
-            nonlocal misses, hits, locks, exceptions
+            nonlocal misses, hits
             cache.clear(reuse=clear_reuse)
             misses = 0
             hits = 0
             locks.clear()
-            exceptions.clear()
 
         _wrapped.cache_clear = cache_clear
 
@@ -378,13 +405,10 @@ def _async_cached_wrapper(
 
     hits = 0
     misses = 0
-    locks: defaultdict[typing.Hashable, _LockWithCounter] = defaultdict(
-        lambda: _LockWithCounter(True)
-    )
-    exceptions: typing.Dict[typing.Hashable, BaseException] = {}
+    locks = _LockRegistry(is_async=True)
 
     async def _wrapped(*args, **kwds):
-        nonlocal hits, misses, locks, exceptions
+        nonlocal hits, misses
 
         if kwds.pop("cachebox__ignore", False):
             return await func(*args, **kwds)
@@ -409,28 +433,29 @@ def _async_cached_wrapper(
 
             return _copy_if_need(result, level=copy_level)
 
-        async with locks[key]:
-            if exceptions.get(key, None) is not None:
-                cached_error = exceptions[key] if locks[key].waiters > 1 else exceptions.pop(key)
-                raise cached_error
+        state = locks.reserve(key)
+        try:
+            async with state:
+                if state.error is not None:
+                    raise state.error
 
-            try:
-                result = _cache[key]
-                hits += 1
-                event = EVENT_HIT
-            except KeyError:
                 try:
-                    result = await func(*args, **kwds)
-                except Exception as e:
-                    if locks[key].waiters > 1:
-                        exceptions[key] = e
-
-                    raise e
-
-                else:
-                    _cache[key] = result
-                    misses += 1
-                    event = EVENT_MISS
+                    result = _cache[key]
+                    hits += 1
+                    event = EVENT_HIT
+                except KeyError:
+                    try:
+                        result = await func(*args, **kwds)
+                    except Exception as error:
+                        state.error = error
+                        raise
+                    else:
+                        _cache[key] = result
+                        misses += 1
+                        event = EVENT_MISS
+        finally:
+            # Also release callers cancelled while acquiring the async lock.
+            locks.release(key, state)
 
         if callback is not None:
             awaitable = callback(event, key, result)
@@ -450,12 +475,11 @@ def _async_cached_wrapper(
     if not cache_is_function:
 
         def cache_clear() -> None:
-            nonlocal misses, hits, locks, exceptions
+            nonlocal misses, hits
             cache.clear(reuse=clear_reuse)
             misses = 0
             hits = 0
             locks.clear()
-            exceptions.clear()
 
         _wrapped.cache_clear = cache_clear
 
