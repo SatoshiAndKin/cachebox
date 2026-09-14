@@ -45,6 +45,11 @@ Homepage = 'https://github.com/awolverp/cachebox'
 
 [tool.pytest.ini_options]
 asyncio_default_fixture_loop_scope = "function"
+addopts = "-p asyncio"
+testpaths = ["python/tests"]
+
+[tool.validation]
+focused_tests = ["python/tests/test_ownership.py", "python/tests/test_gc_memory.py"]
 
 [tool.maturin]
 python-source = "python"
