@@ -120,3 +120,16 @@ jobs:
         run: pytest -v -n auto
         env:
           HYPOTHESIS_PROFILE: slow
+
+  required-ci:
+    name: Required CI
+    if: ${{ always() }}
+    needs: [test-python, test-os]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require both validation matrices
+        env:
+          PYTHON_RESULT: ${{ needs.test-python.result }}
+          OS_RESULT: ${{ needs.test-os.result }}
+        run: test "$PYTHON_RESULT" = success && test "$OS_RESULT" = success
