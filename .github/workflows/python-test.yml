@@ -123,7 +123,7 @@ jobs:
 
   required-ci:
     name: Required CI
-    if: ${{ always() }}
+    if: ${{ !cancelled() }}
     needs: [test-python, test-os]
     runs-on: ubuntu-latest
     timeout-minutes: 2
